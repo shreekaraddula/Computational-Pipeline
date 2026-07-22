@@ -1,0 +1,278 @@
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+from pathlib import Path
+from scipy import ndimage as ndi
+
+
+from skimage.measure import regionprops, label
+from skimage.segmentation import find_boundaries, watershed
+from skimage.filters import threshold_otsu
+from skimage.morphology import (
+    disk,
+    binary_closing,
+    binary_opening,
+    remove_small_objects
+)
+from skimage.feature import peak_local_max
+
+
+
+
+
+
+output_dir = Path(
+    r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\results"
+)
+
+
+
+cyto_path = output_dir / "Normal Grade 1 CYCIF_cytoplasm_QC.png"
+nucleus_path = output_dir / "Cell Segmentation Masks (Old)" / "Normal Grade 1 CYCIF_cytoplasm_QC_nuc_labels.png"
+
+
+
+
+
+cyto_image = cv2.imread(str(cyto_path), cv2.IMREAD_GRAYSCALE)
+nuc_mask = cv2.imread(str(nucleus_path), cv2.IMREAD_GRAYSCALE)
+
+
+if cyto_image is None:
+    raise FileNotFoundError(cyto_path)
+
+
+if nuc_mask is None:
+    raise FileNotFoundError(nucleus_path)
+
+
+
+
+# Normalize cytoplasmic signal 
+cyto_normalized = cv2.normalize(
+    cyto_image,
+    None,
+    0,
+    255,
+    cv2.NORM_MINMAX
+).astype(np.uint8)
+
+
+
+
+# Match sizes
+nuc_mask = cv2.resize(
+    nuc_mask,
+    (cyto_image.shape[1], cyto_image.shape[0]),
+    interpolation=cv2.INTER_NEAREST
+)
+
+
+
+# Use the watershed method to fix nuclei
+
+
+
+binary_nuc = (nuc_mask > 0).astype(np.uint8)
+distance_map = ndi.distance_transform_edt(binary_nuc)
+
+
+coords = peak_local_max(distance_map, min_distance=3, labels=binary_nuc)
+mask_peaks = np.zeros(distance_map.shape, dtype=bool)
+mask_peaks[tuple(coords.T)] = True
+
+
+markers, _ = ndi.label(mask_peaks)
+nuc_labels = watershed(-distance_map, markers, mask=binary_nuc)
+
+
+nuc_props = {r.label: r for r in regionprops(nuc_labels)}
+print("Separated nuclei:", len(nuc_props))
+
+
+# TUNED CONTROLLED EXPANSION & LUMEN BLOCKING
+
+
+
+MAX_CYCIF_EXPANSION = x  # depends on the grade of the tumor
+
+
+# Computes distance from nuclei
+distance, indices = ndi.distance_transform_edt(nuc_labels == 0, return_indices=True)
+nearest_nuc = nuc_labels[tuple(indices)]
+
+
+# lumen detection 
+dark_lumen_mask = cyto_normalized < 35  
+
+
+# Valid cytoplasm zone must have good signal and NOT be inside a dark lumen
+valid_cyto_zone = ((cyto_normalized > 30) & (~dark_lumen_mask)) | (nuc_labels > 0)
+
+
+# Apply constrained cell labels
+expansion_limit = distance <= MAX_CYCIF_EXPANSION
+candidate = expansion_limit & valid_cyto_zone
+
+
+cell_labels = np.zeros_like(nuc_labels)
+cell_labels[candidate] = nearest_nuc[candidate]
+
+
+# Keep original nuclei intact
+cell_labels[nuc_labels > 0] = nuc_labels[nuc_labels > 0]
+
+
+
+
+
+# EXTRA SAFETY WIPES OUT LUMEN CELLS & BORDER TOUCHERS
+
+img_h, img_w = cell_labels.shape
+border_margin = 5  # pixels from edge to consider a cell "cut off"
+
+
+for cell_id in np.unique(cell_labels):
+    if cell_id == 0:
+        continue
+   
+    cell_mask = (cell_labels == cell_id)
+    mean_intensity = cyto_normalized[cell_mask].mean()
+   
+    # Check if cell touches the image boundary
+    y_indices, x_indices = np.where(cell_mask)
+    touches_border = np.any(y_indices <= border_margin) or \
+                     np.any(y_indices >= img_h - border_margin) or \
+                     np.any(x_indices <= border_margin) or \
+                     np.any(x_indices >= img_w - border_margin)
+
+
+    # Wipe out if in lumen/background or cut off by border
+    if mean_intensity < 25 or touches_border:
+        cell_labels[cell_mask] = 0
+       
+
+# CELL QC & N/C RATIO MEASUREMENT
+
+
+
+results = []
+rejected_small = 0
+rejected_large = 0
+rejected_ratio = 0
+rejected_no_nucleus = 0
+
+
+for cell in regionprops(cell_labels):
+    coords = cell.coords
+    nuc_ids = nuc_labels[coords[:, 0], coords[:, 1]]
+    nuc_ids = nuc_ids[nuc_ids > 0]
+
+
+    if len(nuc_ids) == 0:
+        rejected_no_nucleus += 1
+        continue
+
+
+    nucleus_id = np.bincount(nuc_ids).argmax()
+    nucleus = nuc_props[nucleus_id]
+
+
+    cell_area = cell.area
+    nucleus_area = nucleus.area
+    cytoplasm_area = cell_area - nucleus_area
+
+
+    if cytoplasm_area <= 0:
+        continue
+
+
+    nc_ratio = nucleus_area / cytoplasm_area
+
+
+    # QC FILTERS
+    if nucleus_area <= 50:
+        rejected_small += 1
+        continue
+
+
+    if not (150 < cell_area < 5000):
+        rejected_large += 1
+        continue
+
+
+    if not (0.05 < nc_ratio < 3):
+        rejected_ratio += 1
+        continue
+
+
+    if cell.solidity < 0.70:
+        rejected_large += 1
+        continue
+
+
+    results.append({
+        "Cell_ID": cell.label,
+        "Nucleus_ID": nucleus_id,
+        "Nucleus_Area_pixels": nucleus_area,
+        "Cell_Area_pixels": cell_area,
+        "Estimated_Cytoplasm_Area_pixels": cytoplasm_area,
+        "NC_Ratio": nc_ratio,
+        "Centroid_X": int(cell.centroid[1]),
+        "Centroid_Y": int(cell.centroid[0])
+    })
+
+
+df = pd.DataFrame(results)
+
+
+print("--------------------------------")
+print("Valid CyCIF cells:", len(df))
+print("Rejected small:", rejected_small)
+print("Rejected large:", rejected_large)
+print("Rejected ratio:", rejected_ratio)
+print("--------------------------------")
+
+
+csv_path = output_dir / "Normal_Grade_1_CYCIF_Cell_NC_Ratio.csv"
+df.to_csv(csv_path, index=False)
+
+
+
+
+
+# QC VISUALIZATION WITH CELL ID NUMBERS
+
+
+
+plt.figure(figsize=(14, 14))
+plt.imshow(cyto_image, cmap="gray")
+plt.contour(find_boundaries(cell_labels), colors="red", linewidths=0.5)
+plt.contour(find_boundaries(nuc_labels), colors="cyan", linewidths=0.7)
+
+
+# Overlay Cell IDs onto the image for verification
+for idx, row in df.iterrows():
+    plt.text(
+        row["Centroid_X"],
+        row["Centroid_Y"],
+        str(int(row["Cell_ID"])),
+        color="yellow",
+        fontsize=5,
+        ha="center",
+        va="center",
+        bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=0.2)
+    )
+
+
+plt.title(f"Normal Grade 1 CyCIF Cell Segmentation QC with Cell IDs | Valid cells = {len(df)}")
+plt.axis("off")
+
+
+qc_path = output_dir / "Normal_Grade_1_CYCIF_cytoplasm_QC_numbered.png"
+plt.savefig(qc_path, dpi=300, bbox_inches="tight")
+plt.show()
+print("Numbered QC saved:", qc_path)
