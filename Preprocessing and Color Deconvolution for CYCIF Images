@@ -1,0 +1,187 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io, exposure
+from pathlib import Path
+import logging
+
+
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+
+
+def load_cycif_image(img_path: Path) -> np.ndarray:
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image not found: {img_path}")
+
+
+    img = io.imread(img_path)
+
+
+    logging.info(f"Loaded image: {img_path.name}")
+    logging.info(f"Shape: {img.shape}")
+    logging.info(f"Dtype: {img.dtype}")
+    logging.info(f"Intensity range: {img.min()} - {img.max()}")
+
+
+    return img
+
+
+
+
+def robust_scale(channel):
+
+
+    pmin, pmax = np.percentile(channel, (1, 99))
+
+
+    scaled = exposure.rescale_intensity(
+        channel,
+        in_range=(pmin, pmax),
+        out_range=(0, 1)
+    )
+
+
+    return scaled
+
+
+
+
+def process_cycif(img, save_dir, img_name,
+                  nuclei_channel=0,
+                  cyto_channel=1):
+
+
+    # Extract channels
+    nuclei = img[:, :, nuclei_channel]
+    cyto = img[:, :, cyto_channel]
+
+
+    logging.info(
+        f"Nuclei channel: {nuclei_channel} | "
+        f"Cytoplasm channel: {cyto_channel}"
+    )
+    nuclei_qc = robust_scale(nuclei)
+    cyto_qc = robust_scale(cyto)
+
+
+
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+
+    base = Path(img_name).stem
+
+
+
+
+    # Save individual channels
+    plt.imsave(
+        save_dir / f"{base}_nuclei_QC.png",
+        nuclei_qc,
+        cmap="gray"
+    )
+
+
+    plt.imsave(
+        save_dir / f"{base}_cytoplasm_QC.png",
+        cyto_qc,
+        cmap="gray"
+    )
+
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+
+    ax[0].imshow(nuclei_qc, cmap="gray")
+    ax[0].set_title("Nuclei Channel (DAPI)")
+    ax[0].axis("off")
+
+
+
+
+    ax[1].imshow(cyto_qc, cmap="gray")
+    ax[1].set_title("Cytoplasm/Tissue Channel")
+    ax[1].axis("off")
+
+
+
+
+    plt.savefig(
+        save_dir / f"{base}_channel_comparison.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+
+    plt.close(fig)
+
+
+    logging.info("CyCIF QC completed.")
+
+
+    return nuclei, cyto, nuclei_qc, cyto_qc
+
+
+
+
+
+
+def main():
+
+
+    IMAGE_PATH = Path(
+        r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\Lin CRC01 (2021)\High Grade 1 CYCIF.png"
+    )
+
+
+    RESULTS_DIR = Path(
+        r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\results"
+    )
+
+
+
+
+    
+    NUCLEI_CHANNEL = 0
+    CYTO_CHANNEL = 1
+
+
+
+
+    try:
+        img = load_cycif_image(IMAGE_PATH)
+
+
+        nuclei, cyto, nuclei_qc, cyto_qc = process_cycif(
+            img,
+            RESULTS_DIR,
+            IMAGE_PATH.name,
+            nuclei_channel=NUCLEI_CHANNEL,
+            cyto_channel=CYTO_CHANNEL
+        )
+
+
+        logging.info("Stage 1 CyCIF preprocessing complete.")
+
+
+    except Exception as e:
+        logging.error(f"Pipeline failed: {e}")
+
+
+
+
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
