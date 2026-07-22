@@ -1,0 +1,104 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io, exposure
+from skimage.color import rgb2hed
+from pathlib import Path
+import logging
+
+
+import matplotlib
+matplotlib.use('Agg')
+
+
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def load_image(img_path: Path) -> np.ndarray:
+    if not img_path.exists():
+        raise FileNotFoundError(f"Could not find image at {img_path}")
+    img = io.imread(img_path)
+    logging.info(f"Loaded image: {img_path.name} | Shape: {img.shape}")
+    if img.shape[-1] == 4:
+        img = img[:, :, :3]
+        logging.info("Converted RGBA to RGB.")
+    return img
+
+
+def deconvolve_and_qc(img: np.ndarray, save_dir: Path, img_name: str):
+    # splits image into eosin and hematoxylin
+    hed = rgb2hed(img)
+   
+    # RAW arrays for downstream Cellpose
+    hematoxylin_raw = hed[:, :, 0]
+    eosin_raw = hed[:, :, 1]
+
+
+    # reduces cell bleeding while staining
+    h_cleaned = hematoxylin_raw - (0.4 * eosin_raw)
+   
+    # any negative numbers goes back to 0 so all the math while staining will be correcy
+    h_cleaned = np.clip(h_cleaned, 0, None)
+
+
+   
+    # removes dark and bright outliers
+    h_pmin, h_pmax = np.percentile(h_cleaned, (1, 99))
+    e_pmin, e_pmax = np.percentile(eosin_raw, (1, 99))
+
+
+    h_qc = exposure.rescale_intensity(h_cleaned, in_range=(h_pmin, h_pmax), out_range=(0, 1))
+    e_qc = exposure.rescale_intensity(eosin_raw, in_range=(e_pmin, e_pmax), out_range=(0, 1))
+
+
+    # saves visual outputs
+    save_dir.mkdir(parents=True, exist_ok=True)
+    base_name = Path(img_name).stem
+
+
+    plt.imsave(save_dir / f"{base_name}_hematoxylin_QC.png", h_qc, cmap="gray")
+    plt.imsave(save_dir / f"{base_name}_eosin_QC.png", e_qc, cmap="gray")
+
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    ax[0].imshow(h_qc, cmap="gray")
+    ax[0].set_title("Hematoxylin (Nuclei QC)")
+    ax[0].axis("off")
+
+
+    ax[1].imshow(e_qc, cmap="gray")
+    ax[1].set_title("Eosin (Tissue QC)")
+    ax[1].axis("off")
+
+
+    fig.tight_layout()
+    plt.savefig(save_dir / f"{base_name}_comparison_QC.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+    logging.info(f"Saved visual QC outputs for {base_name} in {save_dir}")
+
+
+
+
+    return h_cleaned, eosin_raw
+
+
+def main():
+    IMAGE_PATH = Path(r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\Lin CRC01 (2021)\Normal Grade 1.png")
+    RESULTS_DIR = Path(r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\results")
+
+
+    try:
+        img = load_image(IMAGE_PATH)
+        h_clean, e_raw = deconvolve_and_qc(img, RESULTS_DIR, IMAGE_PATH.name)
+        logging.info("Pipeline Stage 1 (Preprocessing) completed successfully.")
+    except Exception as e:
+        logging.error(f"Pipeline failed: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
+
