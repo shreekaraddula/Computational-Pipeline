@@ -1,0 +1,107 @@
+
+import cv2
+import numpy as np
+import torch
+from pathlib import Path
+from cellpose import models
+
+
+
+file_path = Path(r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\results\Cell Segmentation Masks (New)\Low Grade 1 Hematoxylin.png")
+output_dir = file_path.parent
+base_name = file_path.stem
+
+
+def preprocess_he_for_cellpose(img):
+    # Extract the Green channel (provides the best natural contrast for Hematoxylin in H&E)
+    b, g, r = cv2.split(img)
+   
+    # Invert so nuclei become bright (Cellpose expects bright objects on a dark background)
+    inv_g = cv2.bitwise_not(g)
+   
+    # Apply a gentle CLAHE to pop the nuclei without blowing out the tissue mass
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(inv_g)
+
+
+# Load image
+img = cv2.imread(str(file_path), cv2.IMREAD_COLOR)
+if img is None:
+    raise FileNotFoundError(f"Could not load image: {file_path}")
+
+
+gray = preprocess_he_for_cellpose(img)
+
+
+
+use_gpu = torch.cuda.is_available()
+model = models.CellposeModel(gpu=use_gpu, model_type="nuclei")
+
+
+print("Running Cellpose...")
+masks, flows, styles = model.eval(
+    gray,
+    diameter=None,          # Lets Cellpose auto-estimate cell size based on image resolution
+    channels=[0, 0],
+    flow_threshold=0.4,     # Standard separation strictness
+    cellprob_threshold=0.0, # Standard confidence threshold
+    normalize=True
+)
+
+
+raw_count = len(np.unique(masks)) - 1
+print(f"Raw Cellpose nuclei: {raw_count}")
+
+
+
+print("Filtering out debris and massive artifacts...")
+final_masks = np.zeros_like(masks)
+new_id = 1
+areas = []
+
+
+for nid in np.unique(masks):
+    if nid == 0:
+        continue
+       
+    area = np.sum(masks == nid)
+   
+    # Keeps biologically realistic nucleus sizes 
+    if 50 < area < 3000:
+        final_masks[masks == nid] = new_id
+        areas.append(area)
+        new_id += 1
+
+
+print("-------------------------")
+print(f"Final valid nuclei: {new_id - 1}")
+
+
+if areas:
+    print(f"Mean nucleus area: {int(np.mean(areas))} pixels")
+    print(f"Max nucleus area: {np.max(areas)} pixels")
+
+
+# 1. Raw mask  for  N/C ratio calculations
+np.save(output_dir / f"{base_name}_FINAL_masks.npy", final_masks)
+
+
+# 2. Binary mask 
+cv2.imwrite(str(output_dir / f"{base_name}_binary.png"), (final_masks > 0).astype(np.uint8) * 255)
+
+
+# 3. Colored labels for visual QC
+label_img = np.zeros((*final_masks.shape, 3), dtype=np.uint8)
+rng = np.random.default_rng(1)
+
+
+for i in np.unique(final_masks):
+    if i == 0:
+        continue
+    label_img[final_masks == i] = rng.integers(50, 255, 3)
+
+
+cv2.imwrite(str(output_dir / f"{base_name}_labels.png"), label_img)
+
+
+print("Process Complete.")
