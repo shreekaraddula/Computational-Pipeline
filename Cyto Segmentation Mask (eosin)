@@ -1,0 +1,651 @@
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+from pathlib import Path
+from scipy import ndimage as ndi
+
+
+from skimage.measure import regionprops, label
+from skimage.segmentation import find_boundaries
+from skimage.filters import threshold_otsu
+from skimage.morphology import (
+    disk,
+    binary_closing,
+    binary_opening,
+    remove_small_objects
+)
+
+
+
+
+
+
+
+
+output_dir = Path(
+r"C:\Users\umyed\OneDrive\Desktop\Ramanathan Lab\Tumor Grade Files\New Tumor Grade Files (6-27-26)\results"
+)
+
+
+
+
+eosin_path = output_dir / "Low Grade 2 Eosin.png"
+
+
+
+
+nucleus_path = (
+    output_dir /
+    "Cell Segmentation Masks (New)" /
+    "Low Grade 2 Hematoxylin_refined_labels.png"
+)
+
+
+
+
+
+
+
+eosin = cv2.imread(
+    str(eosin_path),
+    cv2.IMREAD_GRAYSCALE
+)
+
+
+nuc_mask = cv2.imread(
+    str(nucleus_path),
+    cv2.IMREAD_GRAYSCALE
+)
+
+
+
+
+if eosin is None:
+    raise FileNotFoundError(eosin_path)
+
+
+if nuc_mask is None:
+    raise FileNotFoundError(nucleus_path)
+
+
+
+
+
+
+# normalizes eosin
+
+
+eosin = cv2.normalize(
+    eosin,
+    None,
+    0,
+    255,
+    cv2.NORM_MINMAX
+).astype(np.uint8)
+
+
+
+
+
+
+# match sizes
+
+
+nuc_mask = cv2.resize(
+    nuc_mask,
+    (
+        eosin.shape[1],
+        eosin.shape[0]
+    ),
+    interpolation=cv2.INTER_NEAREST
+)
+
+
+
+
+
+
+
+
+
+nuc_labels = label(
+    nuc_mask > 0
+)
+
+
+# nuc masks
+
+nuc_props = {
+    r.label:r
+    for r in regionprops(nuc_labels)
+}
+
+
+
+
+print(
+    "Detected nuclei:",
+    len(nuc_props)
+)
+
+
+
+
+
+
+# tissue mask
+
+threshold = threshold_otsu(
+    eosin
+)
+
+
+
+
+tissue = eosin > threshold
+
+
+
+
+
+
+tissue = binary_opening(
+    tissue,
+    disk(2)
+)
+
+
+
+
+tissue = binary_closing(
+    tissue,
+    disk(4)
+)
+
+
+
+
+tissue = remove_small_objects(
+    tissue,
+    min_size=200
+)
+
+
+
+
+tissue = ndi.binary_fill_holes(
+    tissue
+)
+
+
+
+
+
+
+print(
+    "Tissue pixels:",
+    np.sum(tissue)
+)
+
+
+
+
+
+
+
+
+
+
+distance, indices = ndi.distance_transform_edt(
+    nuc_labels == 0,
+    return_indices=True
+)
+
+
+
+
+
+
+nearest_nucleus = nuc_labels[
+    tuple(indices)
+]
+
+
+
+
+
+
+MAX_EXPANSION = 45
+
+
+
+
+
+
+cell_labels = np.zeros_like(
+    nuc_labels
+)
+
+
+
+
+
+
+candidate = distance <= MAX_EXPANSION
+
+
+
+
+
+
+cell_labels[candidate] = (
+    nearest_nucleus[candidate]
+)
+
+
+
+
+
+
+# keep nuclei
+
+
+cell_labels[
+    nuc_labels > 0
+] = nuc_labels[
+    nuc_labels > 0
+]
+
+
+
+
+
+
+# remove background
+
+
+cell_labels[
+    ~tissue
+] = 0
+
+
+
+
+
+
+print(
+    "Initial cell territories:",
+    len(regionprops(cell_labels))
+)
+
+
+
+
+
+
+# CELL QC
+
+
+results = []
+
+
+
+
+rejected_small = 0
+rejected_large = 0
+rejected_ratio = 0
+rejected_no_nucleus = 0
+
+
+
+
+
+
+for cell in regionprops(cell_labels):
+
+
+
+
+    # Finds nucleus inside the image territory
+
+
+    coords = cell.coords
+
+
+
+
+    nuc_ids = nuc_labels[
+        coords[:,0],
+        coords[:,1]
+    ]
+
+
+
+
+    nuc_ids = nuc_ids[
+        nuc_ids > 0
+    ]
+
+
+
+
+    if len(nuc_ids) == 0:
+        rejected_no_nucleus += 1
+        continue
+
+
+
+
+
+
+    # strongest nucleus overlap
+
+
+    nucleus_id = np.bincount(
+        nuc_ids
+    ).argmax()
+
+
+
+
+
+
+    nucleus = nuc_props[
+        nucleus_id
+    ]
+
+
+
+
+
+
+    cell_area = cell.area
+
+
+    nucleus_area = nucleus.area
+
+
+
+
+
+
+    cytoplasm_area = (
+        cell_area -
+        nucleus_area
+    )
+
+
+
+
+
+
+    if cytoplasm_area <= 0:
+        continue
+
+
+
+
+
+
+    nc_ratio = (
+        nucleus_area /
+        cytoplasm_area
+    )
+
+
+
+
+
+
+    
+    # QC FILTERS
+    
+
+
+    if nucleus_area <= 80:
+        rejected_small += 1
+        continue
+
+
+
+
+    if not (
+        300 < cell_area < 8000
+    ):
+        rejected_large += 1
+        continue
+
+
+
+
+    if not (
+        0.05 < nc_ratio < 2
+    ):
+        rejected_ratio += 1
+        continue
+
+
+
+
+
+
+    results.append({
+
+
+        "Cell_ID":
+            cell.label,
+
+
+        "Nucleus_ID":
+            nucleus_id,
+
+
+        "Nucleus_Area_pixels":
+            nucleus_area,
+
+
+        "Cell_Area_pixels":
+            cell_area,
+
+
+        "Estimated_Cytoplasm_Area_pixels":
+            cytoplasm_area,
+
+
+        "NC_Ratio":
+            nc_ratio,
+
+
+        "Centroid_X":
+            int(cell.centroid[1]),
+
+
+        "Centroid_Y":
+            int(cell.centroid[0])
+
+
+    })
+
+
+
+
+
+
+
+
+
+
+df = pd.DataFrame(
+    results
+)
+
+
+
+
+
+
+print("--------------------------------")
+
+
+print(
+    "Valid cells:",
+    len(df)
+)
+
+
+print(
+    "Rejected small:",
+    rejected_small
+)
+
+
+print(
+    "Rejected large:",
+    rejected_large
+)
+
+
+print(
+    "Rejected ratio:",
+    rejected_ratio
+)
+
+
+print(
+    "Rejected no nucleus:",
+    rejected_no_nucleus
+)
+
+
+print("--------------------------------")
+
+
+
+
+
+
+csv_path = (
+    output_dir /
+    "Low_Grade2_Nucleus_Seeded_Territory_NC_Ratio.csv"
+)
+
+
+
+
+
+
+df.to_csv(
+    csv_path,
+    index=False
+)
+
+
+
+
+
+
+print(
+    "Saved:",
+    csv_path
+)
+
+
+
+
+
+
+
+
+
+plt.figure(
+    figsize=(12,12)
+)
+
+
+
+
+
+
+plt.imshow(
+    eosin,
+    cmap="gray"
+)
+
+
+
+
+
+
+plt.contour(
+    find_boundaries(cell_labels),
+    colors="red",
+    linewidths=0.6
+)
+
+
+
+
+
+
+plt.contour(
+    find_boundaries(nuc_labels),
+    colors="cyan",
+    linewidths=0.8
+)
+
+
+
+
+
+
+plt.title(
+    f"Nucleus-seeded Territory N/C Ratio | Valid cells = {len(df)}"
+)
+
+
+
+
+
+
+plt.axis("off")
+
+
+
+
+
+
+qc_path = (
+    output_dir /
+    "Low_Grade2_Nucleus_Seeded_Territory_QC.png"
+)
+
+
+
+
+
+
+plt.savefig(
+    qc_path,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+
+
+
+
+
+plt.show()
+
+
+
+
+
+
+print(
+    "QC saved:",
+    qc_path
+)
